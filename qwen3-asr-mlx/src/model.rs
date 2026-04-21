@@ -26,16 +26,72 @@ pub mod testing {
     /// main `config.json` has no `quantization` field. No-op otherwise.
     ///
     /// xiaoyu's `mlx-qwen3-asr` converter writes the quantization block to a
-    /// separate file; `load()` calls this helper so both layouts work. Exposed
-    /// for unit tests; production code calls it transparently.
+    /// separate file; `load()` calls this helper so both layouts work. Silent
+    /// no-op when the sibling is absent; logs and bails out when the file
+    /// exists but is unreadable, malformed, or not a JSON object (any of
+    /// which would poison downstream config parsing).
     pub fn merge_quantization_config(model_dir: &Path, config_json: &mut serde_json::Value) {
         if config_json.get("quantization").is_some() {
             return;
         }
         let q_path = model_dir.join("quantization_config.json");
-        let Ok(q_str) = std::fs::read_to_string(&q_path) else { return };
-        let Ok(q_val) = serde_json::from_str::<serde_json::Value>(&q_str) else { return };
+        let q_str = match std::fs::read_to_string(&q_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                eprintln!(
+                    "warning: quantization_config.json at {} unreadable: {}",
+                    q_path.display(), e
+                );
+                return;
+            }
+        };
+        let q_val: serde_json::Value = match serde_json::from_str(&q_str) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "warning: quantization_config.json at {} is not valid JSON: {}",
+                    q_path.display(), e
+                );
+                return;
+            }
+        };
+        if !q_val.is_object() {
+            eprintln!(
+                "warning: quantization_config.json at {} is not a JSON object; ignoring",
+                q_path.display()
+            );
+            return;
+        }
         config_json["quantization"] = q_val;
+    }
+
+    /// Assemble the Qwen3-ASR chat-template prompt. Pure function; extracted
+    /// from `build_prompt` so the `set_context`-driven system-block injection
+    /// is unit-testable without spinning up a full model.
+    ///
+    /// Format (must stay byte-identical for existing callers that leave
+    /// `context` empty):
+    ///
+    /// ```text
+    /// <|im_start|>system
+    /// {context}<|im_end|>
+    /// <|im_start|>user
+    /// <|audio_start|>{audio_pads}<|audio_end|><|im_end|>
+    /// <|im_start|>assistant
+    /// language {language}<asr_text>
+    /// ```
+    pub fn format_transcribe_prompt(
+        context: &str,
+        num_audio_tokens: i32,
+        language: &str,
+    ) -> String {
+        format!(
+            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n<|audio_start|>{}<|audio_end|><|im_end|>\n<|im_start|>assistant\nlanguage {}<asr_text>",
+            context,
+            "<|audio_pad|>".repeat(num_audio_tokens as usize),
+            language,
+        )
     }
 }
 
@@ -738,12 +794,7 @@ impl Qwen3ASR {
         let tokenizer = self.tokenizer.as_ref()
             .ok_or_else(|| Error::Tokenizer("Tokenizer not loaded".to_string()))?;
 
-        let prompt = format!(
-            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n<|audio_start|>{}<|audio_end|><|im_end|>\n<|im_start|>assistant\nlanguage {}<asr_text>",
-            self.context,
-            "<|audio_pad|>".repeat(num_audio_tokens as usize),
-            language,
-        );
+        let prompt = testing::format_transcribe_prompt(&self.context, num_audio_tokens, language);
 
         let encoding = tokenizer.encode(prompt.as_str(), false)
             .map_err(|e| Error::Tokenizer(e.to_string()))?;

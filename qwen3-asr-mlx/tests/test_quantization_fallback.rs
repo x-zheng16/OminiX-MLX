@@ -71,3 +71,37 @@ fn noop_when_sibling_file_absent() {
 
     assert!(cfg.get("quantization").is_none());
 }
+
+#[test]
+fn ignores_malformed_quantization_config() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("quantization_config.json"),
+        r#"not valid json {"#,
+    )
+    .unwrap();
+
+    let mut cfg: serde_json::Value = serde_json::json!({
+        "architectures": ["Qwen3ASRForConditionalGeneration"],
+    });
+
+    merge_quantization_config(dir.path(), &mut cfg);
+
+    assert!(cfg.get("quantization").is_none(),
+            "malformed sibling JSON must not be merged into config");
+}
+
+#[test]
+fn ignores_non_object_quantization_config() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("quantization_config.json"), r#"[4, 64]"#).unwrap();
+
+    let mut cfg: serde_json::Value = serde_json::json!({
+        "architectures": ["Qwen3ASRForConditionalGeneration"],
+    });
+
+    merge_quantization_config(dir.path(), &mut cfg);
+
+    assert!(cfg.get("quantization").is_none(),
+            "non-object sibling must not poison config[\"quantization\"]");
+}
