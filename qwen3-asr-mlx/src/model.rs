@@ -166,6 +166,10 @@ pub struct Qwen3ASR {
 
     /// EOS token IDs for stopping generation
     eos_token_ids: Vec<i32>,
+
+    /// System prompt context injected into every transcription.
+    /// Set via `set_context`. Empty by default (no system prompt).
+    context: String,
 }
 
 // ============================================================================
@@ -345,6 +349,7 @@ impl Qwen3ASR {
             mel_frontend,
             tokenizer,
             eos_token_ids,
+            context: String::new(),
         })
     }
 
@@ -572,6 +577,15 @@ impl Qwen3ASR {
         }
     }
 
+    /// Set the system prompt context injected before every transcription.
+    ///
+    /// Pass a free-form instruction string (e.g. domain vocabulary, style hints).
+    /// Call once after loading; the context is reused for all subsequent calls.
+    /// Pass an empty string to clear.
+    pub fn set_context(&mut self, ctx: impl Into<String>) {
+        self.context = ctx.into();
+    }
+
     /// Transcribe audio file.
     pub fn transcribe(&mut self, audio_path: impl AsRef<Path>) -> Result<String> {
         self.transcribe_with_language(audio_path, "Chinese")
@@ -703,7 +717,8 @@ impl Qwen3ASR {
             .ok_or_else(|| Error::Tokenizer("Tokenizer not loaded".to_string()))?;
 
         let prompt = format!(
-            "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>{}<|audio_end|><|im_end|>\n<|im_start|>assistant\nlanguage {}<asr_text>",
+            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n<|audio_start|>{}<|audio_end|><|im_end|>\n<|im_start|>assistant\nlanguage {}<asr_text>",
+            self.context,
             "<|audio_pad|>".repeat(num_audio_tokens as usize),
             language,
         );
