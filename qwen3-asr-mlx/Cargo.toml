@@ -34,3 +34,6 @@ dirs = "5"
 [[example]]
 name = "transcribe"
 path = "examples/transcribe.rs"
+
+[dev-dependencies]
+tempfile.workspace = true
