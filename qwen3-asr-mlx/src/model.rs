@@ -18,6 +18,27 @@ use mlx_rs::Array;
 use std::collections::HashMap;
 use std::path::Path;
 
+#[doc(hidden)]
+pub mod testing {
+    use std::path::Path;
+
+    /// Merge a sibling `quantization_config.json` into `config_json` when the
+    /// main `config.json` has no `quantization` field. No-op otherwise.
+    ///
+    /// xiaoyu's `mlx-qwen3-asr` converter writes the quantization block to a
+    /// separate file; `load()` calls this helper so both layouts work. Exposed
+    /// for unit tests; production code calls it transparently.
+    pub fn merge_quantization_config(model_dir: &Path, config_json: &mut serde_json::Value) {
+        if config_json.get("quantization").is_some() {
+            return;
+        }
+        let q_path = model_dir.join("quantization_config.json");
+        let Ok(q_str) = std::fs::read_to_string(&q_path) else { return };
+        let Ok(q_val) = serde_json::from_str::<serde_json::Value>(&q_str) else { return };
+        config_json["quantization"] = q_val;
+    }
+}
+
 /// Quantization configuration.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct QuantizationConfig {
@@ -288,10 +309,11 @@ impl Qwen3ASR {
                 "config.json not found at {}", config_path.display()
             )));
         }
-        let config_json: serde_json::Value = {
+        let mut config_json: serde_json::Value = {
             let file = std::fs::File::open(&config_path)?;
             serde_json::from_reader(file)?
         };
+        testing::merge_quantization_config(model_dir, &mut config_json);
         let config = Qwen3ASRConfig::from_config_json(&config_json)?;
 
         eprintln!("Audio encoder: {} layers, d_model={}", config.audio_config.encoder_layers, config.audio_config.d_model);
