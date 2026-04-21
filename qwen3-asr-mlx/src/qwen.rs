@@ -4,7 +4,7 @@
 //! All dimensions are parsed from `config.json`.
 
 use crate::error::Result;
-use mlx_rs_core::{initialize_rope, KeyValueCache, KVCache};
+use mlx_rs_core::{fused_swiglu, initialize_rope, KeyValueCache, KVCache};
 use mlx_rs::fast::ScaledDotProductAttentionMask;
 use mlx_rs::builder::Builder;
 use mlx_rs::macros::ModuleParameters;
@@ -237,7 +237,7 @@ impl Module<&Array> for QwenMLP {
     fn forward(&mut self, x: &Array) -> std::result::Result<Array, Self::Error> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let activated = nn::silu(&gate)?.multiply(&up)?;
+        let activated = fused_swiglu(&up, &gate)?;
         self.down_proj.forward(&activated)
     }
 }
