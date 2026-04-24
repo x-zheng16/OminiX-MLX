@@ -874,7 +874,7 @@ impl Qwen3ASR {
         let logits = self.model.compute_logits(&last_hidden)?;
 
         let last_logits = logits.index((.., -1, ..));
-        let token = Self::sample(&last_logits, config)?;
+        let mut token = Self::sample(&last_logits, config)?;
         eval([&token])?;
         let mut token_id = token.item::<i32>();
 
@@ -896,8 +896,14 @@ impl Qwen3ASR {
 
             tokens.push(token_id);
 
-            // Get embedding for next token
-            let token_array = Array::from_slice(&[token_id], &[1, 1]);
+            // Reshape the already-materialized sampled token Array ([1] -> [1, 1])
+            // instead of rebuilding via `Array::from_slice(&[token_id], ...)`. The
+            // from-slice form is a CPU->MLX round-trip (i32 scalar is already on
+            // CPU via `.item::<i32>()` for the control-flow check, and re-wrapping
+            // it into a fresh MLX Array allocates a new 1-element buffer every
+            // decode step). `token` from `Self::sample` is already materialized by
+            // the preceding `eval([&token])?`, so `reshape` is a metadata-only op.
+            let token_array = token.reshape(&[1, 1])?;
             let h = self.model.get_token_embeddings(&token_array)?;
 
             // Forward through decoder
@@ -907,7 +913,7 @@ impl Qwen3ASR {
             let logits = self.model.compute_logits(&last_hidden)?;
 
             let last_logits = logits.index((.., -1, ..));
-            let token = Self::sample(&last_logits, config)?;
+            token = Self::sample(&last_logits, config)?;
             eval([&token])?;
             token_id = token.item::<i32>();
         }
