@@ -317,3 +317,27 @@ fn create_whisper_mel_filterbank(sample_rate: u32, n_fft: usize, n_mels: usize) 
 
     mel_filters
 }
+
+/// Test-only accessors for the MelFrontend owned-field cache invariant.
+///
+/// Used by the integration test `test_mel_frontend_caching` to prove that
+/// `compute_mel_spectrogram` reads the owned `mel_filters` / `window` fields
+/// instead of rebuilding them per call.
+#[doc(hidden)]
+pub mod testing {
+    use super::MelFrontend;
+
+    pub fn mel_filters_slice(frontend: &MelFrontend) -> &[f32] {
+        &frontend.mel_filters
+    }
+
+    pub fn window_slice(frontend: &MelFrontend) -> &[f32] {
+        &frontend.window
+    }
+
+    pub fn scale_mel_filters(frontend: &mut MelFrontend, factor: f32) {
+        for v in frontend.mel_filters.iter_mut() {
+            *v *= factor;
+        }
+    }
+}
