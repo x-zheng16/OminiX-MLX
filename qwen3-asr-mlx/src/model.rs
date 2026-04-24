@@ -898,12 +898,22 @@ impl Qwen3ASR {
 
             // Reshape the already-materialized sampled token Array ([1] -> [1, 1])
             // instead of rebuilding via `Array::from_slice(&[token_id], ...)`. The
-            // from-slice form is a CPU->MLX round-trip (i32 scalar is already on
-            // CPU via `.item::<i32>()` for the control-flow check, and re-wrapping
-            // it into a fresh MLX Array allocates a new 1-element buffer every
-            // decode step). `token` from `Self::sample` is already materialized by
-            // the preceding `eval([&token])?`, so `reshape` is a metadata-only op.
-            let token_array = token.reshape(&[1, 1])?;
+            // from-slice form was a CPU->MLX round-trip (the i32 scalar was
+            // already on CPU via `.item::<i32>()` for the eos + repetition checks,
+            // and re-wrapping it into a fresh MLX Array allocated a new
+            // 1-element buffer every decode step). `token` from `Self::sample`
+            // is already materialized by the preceding `eval([&token])?`, so
+            // `reshape` is a metadata-only op. The `.as_dtype(Dtype::Int32)` pins
+            // the embedding-input dtype to match the prompt-prefill path
+            // (`build_prompt` -> `Array::from_slice(&[i32])` feeds Int32 into the
+            // same `get_token_embeddings`); `argmax_axis` and `categorical`
+            // return Uint32, so without the cast the decode loop would feed a
+            // different integer dtype into the embedding layer than the prefill
+            // pass. `as_dtype` on unified memory is metadata-only when the
+            // source buffer is already resident.
+            let token_array = token
+                .reshape(&[1, 1])?
+                .as_dtype(mlx_rs::Dtype::Int32)?;
             let h = self.model.get_token_embeddings(&token_array)?;
 
             // Forward through decoder
