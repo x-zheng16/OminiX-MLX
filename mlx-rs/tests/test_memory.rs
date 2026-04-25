@@ -45,21 +45,39 @@ fn clear_cache_is_callable_on_empty_pool() {
 fn clear_cache_drops_cache_memory_after_allocation_drop() {
     // Allocate-then-drop pattern: an Array's underlying Metal buffer goes
     // into the cache pool when the Array is dropped, growing
-    // `get_cache_memory`. `clear_cache` MUST then bring it back down.
+    // `get_cache_memory`. `clear_cache` MUST then bring it back down --
+    // strictly, not just non-increasing, otherwise a future no-op
+    // `clear_cache` regression would pass this test silently.
     //
-    // We compare cache-after-drop vs cache-after-clear, not absolute values,
-    // so the test is robust to whatever baseline the runtime carries.
+    // Pre-flight `clear_cache` so the comparison baseline is a known-empty
+    // pool, not whatever earlier tests in this binary left behind.
+    memory::clear_cache();
+    let cache_baseline = memory::get_cache_memory();
+
     {
         let arr = Array::from_slice(&[0.0f32; 4 * 1024 * 1024], &[4 * 1024 * 1024]);
-        // Force materialization so the buffer actually exists in the pool.
+        // Force materialization so the buffer actually exists when dropped
+        // (otherwise lazy MLX would never realize the allocation, the pool
+        // wouldn't grow, and the test would fail to set up).
         let _: &[f32] = arr.as_slice();
     }
     let cache_after_drop = memory::get_cache_memory();
+    assert!(
+        cache_after_drop > cache_baseline,
+        "test setup invariant: dropping a 16 MiB materialized Array MUST grow \
+         the cache pool above the cleared baseline. baseline={} after_drop={}",
+        cache_baseline,
+        cache_after_drop
+    );
+
     memory::clear_cache();
     let cache_after_clear = memory::get_cache_memory();
     assert!(
-        cache_after_clear <= cache_after_drop,
-        "clear_cache must not GROW cache_memory: was {} bytes, became {} bytes",
+        cache_after_clear < cache_after_drop,
+        "clear_cache must STRICTLY reduce cache_memory (a no-op clear_cache \
+         would silently pass a non-strict comparison). baseline={} \
+         after_drop={} after_clear={}",
+        cache_baseline,
         cache_after_drop,
         cache_after_clear
     );
