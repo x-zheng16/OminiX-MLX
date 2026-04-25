@@ -786,7 +786,26 @@ impl Qwen3ASR {
         eval([&inputs_embeds])?;
 
         // 5. Autoregressive generation
-        self.generate(&inputs_embeds, config)
+        let result = self.generate(&inputs_embeds, config);
+
+        // 6. Each `transcribe_samples_with_config` call is logically zero-shot
+        //    -- the per-call KV cache, encoder activations, mel spectrogram,
+        //    and prompt embeddings have no role in the next call. Drop them
+        //    explicitly so their Metal buffers leave the "live" set, then
+        //    drain MLX's allocator pool back to the OS via `clear_cache()`.
+        //    Without this, MLX retains the largest working-set buffers it has
+        //    ever allocated for fast recycling, which on a long-running
+        //    daemon (e.g., xiaoyu) makes the process footprint grow
+        //    monotonically with the longest clip ever transcribed -- a
+        //    11.8 GB Apple-Silicon-unified-memory regression observed in
+        //    practice after a single ~70 s Chinese ASR pass.
+        drop(inputs_embeds);
+        drop(audio_features);
+        drop(input_ids);
+        drop(mel);
+        mlx_rs::memory::clear_cache();
+
+        result
     }
 
     /// Build prompt token IDs.
