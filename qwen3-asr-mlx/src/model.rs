@@ -15,7 +15,9 @@ use mlx_rs::ops::indexing::{argmax_axis, IndexOp};
 use mlx_rs::quantization::MaybeQuantized;
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 #[doc(hidden)]
@@ -247,6 +249,26 @@ pub struct Qwen3ASR {
     /// System prompt context injected into every transcription.
     /// Set via `set_context`. Empty by default (no system prompt).
     context: String,
+
+    /// KV cache for the static system-block prefix
+    /// (`<|im_start|>system\n{context}<|im_end|>\n`). Built lazily on first
+    /// transcribe and rebuilt when `context` changes (detected via hash).
+    /// Reused on every subsequent call to skip prompt prefill.
+    prompt_cache: Option<PromptCache>,
+}
+
+/// Cached KV state for the system-block prefix.
+struct PromptCache {
+    /// `DefaultHasher::finish()` of the context string at build time.
+    /// Mismatch on next call triggers rebuild.
+    context_hash: u64,
+    /// Number of tokens in the cached prefix (`<|im_start|>system\n{ctx}<|im_end|>\n`).
+    /// Subtracted from `inputs_embeds` along axis 1 in `generate` to feed only
+    /// the post-prefix portion through the decoder.
+    sys_token_count: i32,
+    /// Per-layer KV state. `Vec<KVCache>` (not `Vec<Option<KVCache>>`) because
+    /// every layer is populated after the prefill that built this cache.
+    cache: Vec<KVCache>,
 }
 
 // ============================================================================
@@ -428,6 +450,7 @@ impl Qwen3ASR {
             tokenizer,
             eos_token_ids,
             context: String::new(),
+            prompt_cache: None,
         })
     }
 
@@ -661,7 +684,13 @@ impl Qwen3ASR {
     /// Call once after loading; the context is reused for all subsequent calls.
     /// Pass an empty string to clear.
     pub fn set_context(&mut self, ctx: impl Into<String>) {
-        self.context = ctx.into();
+        let new_ctx = ctx.into();
+        if new_ctx != self.context {
+            // Drop stale prompt-cache buffers so MLX can free them. The next
+            // `generate` will rebuild against the new context.
+            self.prompt_cache = None;
+            self.context = new_ctx;
+        }
     }
 
     /// Transcribe audio file.
@@ -874,18 +903,77 @@ impl Qwen3ASR {
         }
     }
 
+    /// Build (or rebuild) the system-block KV cache for the current
+    /// `self.context`. No-op if the cache is already built for this context.
+    fn ensure_prompt_cache(&mut self) -> Result<()> {
+        let mut hasher = DefaultHasher::new();
+        self.context.hash(&mut hasher);
+        let h = hasher.finish();
+
+        if self.prompt_cache.as_ref().map(|pc| pc.context_hash) == Some(h) {
+            return Ok(());
+        }
+
+        let tokenizer = self.tokenizer.as_ref()
+            .ok_or_else(|| Error::Tokenizer("Tokenizer not loaded".to_string()))?;
+
+        // Match the system block of `format_transcribe_prompt`. Must stay
+        // byte-identical or the cached KV is out of sync with what the full
+        // prompt would have produced.
+        let sys_text = format!("<|im_start|>system\n{}<|im_end|>\n", self.context);
+        let encoding = tokenizer.encode(sys_text.as_str(), false)
+            .map_err(|e| Error::Tokenizer(e.to_string()))?;
+        let ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
+        let n = ids.len() as i32;
+        let input_ids = Array::from_slice(&ids, &[1, n]);
+
+        let embeds = self.model.get_token_embeddings(&input_ids)?;
+        let mut cache: Vec<Option<KVCache>> = Vec::new();
+        let hidden = self.model.forward_embeddings(&embeds, &mut cache)?;
+        // Force prefill to materialize KV state before we drop the hidden tensor.
+        eval([&hidden])?;
+
+        let cache_owned: Vec<KVCache> = cache.into_iter().filter_map(|c| c).collect();
+        self.prompt_cache = Some(PromptCache {
+            context_hash: h,
+            sys_token_count: n,
+            cache: cache_owned,
+        });
+        Ok(())
+    }
+
     /// Autoregressive text generation.
+    ///
+    /// Uses the cached system-block KV (`prompt_cache`) to skip prefill on the
+    /// stable prefix `<|im_start|>system\n{context}<|im_end|>\n`. The cache is
+    /// built lazily and rebuilt on context change. Per-call audio + assistant
+    /// tokens prefill against the cloned cache so its persisted state is left
+    /// untouched.
     fn generate(
         &mut self,
         inputs_embeds: &Array,
         config: &SamplingConfig,
     ) -> Result<String> {
-        let mut cache: Vec<Option<KVCache>> = Vec::new();
+        self.ensure_prompt_cache()?;
+        let pc = self.prompt_cache.as_ref().expect("ensure_prompt_cache populates");
+        let sys_n = pc.sys_token_count;
+
+        // KVCache derives Clone; mutations in update_and_fetch create new
+        // Arrays via concatenate_axis, so cloned caches are independent of the
+        // saved prefix state.
+        let mut cache: Vec<Option<KVCache>> =
+            pc.cache.iter().map(|c| Some(c.clone())).collect();
+
+        // Skip the first sys_n positions along axis 1 — those are already in
+        // the cached KV. RoPE in qwen.rs uses cache.offset() (= sys_n after
+        // load) so post-prefix tokens get correct positional encoding.
+        let post_sys_embeds = inputs_embeds.index((.., sys_n.., ..));
+
         let mut tokens: Vec<i32> = Vec::new();
         let eos_tokens = &self.eos_token_ids;
 
-        // First forward pass with full prompt
-        let hidden_states = self.model.forward_embeddings(inputs_embeds, &mut cache)?;
+        // First forward pass: post-system prompt portion only (audio + assistant block).
+        let hidden_states = self.model.forward_embeddings(&post_sys_embeds, &mut cache)?;
 
         // Get logits from last position using tied weights
         let last_hidden = hidden_states.index((.., -1, ..));
